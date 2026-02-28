@@ -1,6 +1,6 @@
 streamlit
-opencv-python
-dlib
+opencv-python-headless
+dlib-bin
 numpy
 scipy
 pandas
