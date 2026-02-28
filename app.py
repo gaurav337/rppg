@@ -1,10 +1,11 @@
 """
-Aegis-X  ·  Live rPPG Heartbeat Monitor  v2.0
+Aegis-X  ·  Live rPPG Heartbeat Monitor  v2.1
 ================================================
 A premium Streamlit application that uses remote photoplethysmography (rPPG)
 to measure heart rate in real-time from your webcam.
 
-v2.0 — CHROM method, adaptive filtering, session stats, improved UI.
+v2.1 — WebRTC-based camera for cloud deployment, CHROM + POS methods,
+       adaptive filtering, session stats, improved UI.
 """
 
 import streamlit as st
@@ -16,8 +17,12 @@ import os
 import urllib.request
 import bz2
 import pandas as pd
+import av
+import queue
+import threading
 from collections import deque
-from scipy.signal import butter, filtfilt, welch, detrend, find_peaks, medfilt
+from scipy.signal import butter, filtfilt, welch, detrend, find_peaks
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 
 # ─────────────────────────────────────────────
 # Configuration
@@ -413,6 +418,13 @@ footer {visibility: hidden;}
     flex-shrink: 0;
     margin-top: 1px;
 }
+
+/* ── WebRTC video styling ── */
+video {
+    border-radius: 16px !important;
+    border: 1px solid rgba(255,255,255,0.06) !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3) !important;
+}
 </style>
 """
 
@@ -736,6 +748,126 @@ def get_display_signal(rgb_buffer, fps):
 
 
 # ─────────────────────────────────────────────
+# WebRTC Video Processor
+# ─────────────────────────────────────────────
+class RPPGProcessor(VideoProcessorBase):
+    """
+    Processes each video frame from the browser webcam via WebRTC.
+    Runs in a separate thread — communicates results to the main
+    Streamlit thread via a thread-safe queue.
+    """
+
+    def __init__(self):
+        self._detector, self._predictor = load_detector_and_predictor()
+        self._rgb_buffer = deque(maxlen=MAX_BUFFER)
+        self._time_buffer = deque(maxlen=MAX_BUFFER)
+        self._face_buffer = deque(maxlen=MAX_BUFFER)
+        self._bpm_raw_history = deque(maxlen=120)
+        self._bpm_smooth_history = deque(maxlen=120)
+        self._last_valid_bpm = 0.0
+        self._session_bpms: list[float] = []
+        self._start_time = time.time()
+        self._frame_count = 0
+        self._lock = threading.Lock()
+        # Thread-safe queue for sending results to the main thread
+        self.result_queue: queue.Queue = queue.Queue(maxsize=5)
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        now = time.time()
+
+        with self._lock:
+            self._frame_count += 1
+
+            # Extract RGB from face ROIs
+            rgb_means, annotated, face_found = extract_rgb_from_frame(
+                img_rgb, self._detector, self._predictor
+            )
+
+            if rgb_means is not None:
+                self._rgb_buffer.append(rgb_means)
+            else:
+                self._rgb_buffer.append(np.array([np.nan, np.nan, np.nan]))
+
+            self._time_buffer.append(now)
+            self._face_buffer.append(1 if face_found else 0)
+
+            # Compute metrics
+            elapsed = now - self._start_time
+            n = len(self._time_buffer)
+            if n > 1:
+                fps_est = (n - 1) / (self._time_buffer[-1] - self._time_buffer[0] + 1e-9)
+            else:
+                fps_est = 30.0
+            face_pct = 100.0 * sum(self._face_buffer) / len(self._face_buffer)
+
+            bpm, confidence = 0.0, 0.0
+            display_signal = None
+
+            if len(self._rgb_buffer) >= MIN_FRAMES_FOR_BPM and fps_est > 5:
+                bpm, confidence = compute_bpm(list(self._rgb_buffer), fps_est)
+
+                # Temporal smoothing: reject huge jumps
+                if bpm > 0 and self._last_valid_bpm > 0:
+                    if abs(bpm - self._last_valid_bpm) > BPM_JUMP_THRESHOLD:
+                        bpm = self._last_valid_bpm * 0.7 + bpm * 0.3
+                        confidence *= 0.6
+
+                if bpm > 0:
+                    self._bpm_raw_history.append(bpm)
+
+                    # Median filter for display
+                    if len(self._bpm_raw_history) >= BPM_SMOOTH_WINDOW:
+                        recent = list(self._bpm_raw_history)[-BPM_SMOOTH_WINDOW:]
+                        smoothed = float(np.median(recent))
+                    else:
+                        smoothed = bpm
+                    self._bpm_smooth_history.append(smoothed)
+                    self._last_valid_bpm = smoothed
+                    bpm = smoothed  # use smoothed for display
+
+                    # Session stats
+                    self._session_bpms.append(smoothed)
+
+                # Display signal
+                try:
+                    display_signal = get_display_signal(list(self._rgb_buffer), fps_est)
+                except Exception:
+                    pass
+
+            # Build result dict for the main thread
+            result = {
+                "bpm": bpm,
+                "confidence": confidence,
+                "fps": fps_est,
+                "face_pct": face_pct,
+                "buffer_len": len(self._rgb_buffer),
+                "elapsed": elapsed,
+                "display_signal": display_signal.tolist() if display_signal is not None else None,
+                "bpm_history": list(self._bpm_smooth_history),
+                "session_bpms": list(self._session_bpms),
+            }
+
+            # Non-blocking put — drop old results if queue is full
+            try:
+                self.result_queue.put_nowait(result)
+            except queue.Full:
+                try:
+                    self.result_queue.get_nowait()  # discard oldest
+                except queue.Empty:
+                    pass
+                try:
+                    self.result_queue.put_nowait(result)
+                except queue.Full:
+                    pass
+
+        # Return the annotated frame (convert back to BGR for WebRTC)
+        out = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+        return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+
+# ─────────────────────────────────────────────
 # UI Helpers
 # ─────────────────────────────────────────────
 def render_bpm_card(bpm, confidence):
@@ -774,12 +906,12 @@ def render_bpm_card(bpm, confidence):
 
 def render_session_stats(bpm_min, bpm_max, bpm_avg, reading_count):
     if reading_count < 1:
-        lo = hi = av = "—"
+        lo = hi = av_val = "—"
         lo_sub = hi_sub = av_sub = "no data yet"
     else:
         lo = f"{bpm_min:.0f}"
         hi = f"{bpm_max:.0f}"
-        av = f"{bpm_avg:.0f}"
+        av_val = f"{bpm_avg:.0f}"
         lo_sub = "bpm"
         hi_sub = "bpm"
         av_sub = f"over {reading_count} readings"
@@ -794,7 +926,7 @@ def render_session_stats(bpm_min, bpm_max, bpm_avg, reading_count):
         </div>
         <div class="stat-card avg">
             <div class="stat-label">Average</div>
-            <div class="stat-val avg-color">{av}</div>
+            <div class="stat-val avg-color">{av_val}</div>
             <div class="stat-sub">{av_sub}</div>
         </div>
         <div class="stat-card high">
@@ -865,7 +997,7 @@ def main():
     with header_l:
         st.markdown(
             '<div class="hero-container">'
-            '<div><p class="hero-title">Aegis-X <span class="hero-version">v2.0</span></p>'
+            '<div><p class="hero-title">Aegis-X <span class="hero-version">v2.1</span></p>'
             '<p class="hero-sub">Remote Photoplethysmography · Live Heart Rate Monitor</p></div>'
             '</div>',
             unsafe_allow_html=True,
@@ -889,23 +1021,28 @@ def main():
     with col_cam:
         st.markdown('<div class="section-label">Camera Feed</div>', unsafe_allow_html=True)
 
-        if "running" not in st.session_state:
-            st.session_state.running = False
-
-        btn_label = "⏹  Stop Monitoring" if st.session_state.running else "▶  Start Monitoring"
-        if st.button(btn_label, use_container_width=True, key="toggle_btn"):
-            st.session_state.running = not st.session_state.running
-            # Reset session stats on stop
-            if not st.session_state.running:
-                for k in ["sess_bpms"]:
-                    st.session_state.pop(k, None)
-            st.rerun()
-
-        frame_placeholder = st.empty()
+        # WebRTC streamer — uses browser camera via WebRTC
+        webrtc_ctx = webrtc_streamer(
+            key="rppg-stream",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=RPPGProcessor,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 30},
+                },
+                "audio": False,
+            },
+            rtc_configuration={
+                "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+            },
+            async_processing=True,
+        )
 
         st.markdown(
             '<div class="info-panel">'
-            '<strong>🔬 How it works:</strong> Aegis-X v2.0 uses the <strong>CHROM</strong> and '
+            '<strong>🔬 How it works:</strong> Aegis-X v2.1 uses the <strong>CHROM</strong> and '
             '<strong>POS</strong> rPPG algorithms to extract your pulse from subtle color changes '
             'in facial skin. Multiple ROIs (forehead, cheeks, nose bridge) are fused for accuracy.'
             '</div>',
@@ -941,181 +1078,105 @@ def main():
         st.markdown('<div class="section-label">BPM Trend</div>', unsafe_allow_html=True)
         history_placeholder = st.empty()
 
-    # ── Main Loop ──
-    if st.session_state.running:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("🚫 Cannot access webcam. Check that your camera is connected.")
-            st.session_state.running = False
-            st.rerun()
+    # ── Real-time data polling from the WebRTC processor thread ──
+    if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+        processor = webrtc_ctx.video_processor
 
-        # Optimize camera
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        # Poll results from the processor's queue and update the UI
+        while True:
+            if not webrtc_ctx.state.playing:
+                break
 
-        rgb_buffer = deque(maxlen=MAX_BUFFER)
-        time_buffer = deque(maxlen=MAX_BUFFER)
-        face_buffer = deque(maxlen=MAX_BUFFER)
-        bpm_raw_history = deque(maxlen=120)
-        bpm_smooth_history = deque(maxlen=120)
-        bpm_time_history = deque(maxlen=120)
+            try:
+                result = processor.result_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-        # Session stats
-        session_bpms = []
-        last_valid_bpm = 0.0
-        start_time = time.time()
-        frame_count = 0
+            bpm = result["bpm"]
+            confidence = result["confidence"]
+            fps_est = result["fps"]
+            face_pct = result["face_pct"]
+            buffer_len = result["buffer_len"]
+            elapsed = result["elapsed"]
+            display_signal = result["display_signal"]
+            bpm_history = result["bpm_history"]
+            session_bpms = result["session_bpms"]
 
-        try:
-            while st.session_state.running:
-                ret, frame = cap.read()
-                if not ret:
-                    frame_placeholder.error("❌ Lost camera feed.")
-                    break
-
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                now = time.time()
-                frame_count += 1
-
-                # Extract RGB
-                rgb_means, annotated, face_found = extract_rgb_from_frame(
-                    frame, detector, predictor
+            # ── Waveform ──
+            if display_signal is not None and len(display_signal) > 10:
+                wave = np.array(display_signal)
+                display_len = min(200, len(wave))
+                wave = wave[-display_len:]
+                wave = (wave - np.mean(wave)) / (np.std(wave) + 1e-9)
+                chart_placeholder.line_chart(
+                    pd.DataFrame({"rPPG": wave}),
+                    height=160,
+                    use_container_width=True,
                 )
-                if rgb_means is not None:
-                    rgb_buffer.append(rgb_means)
-                else:
-                    # Append last known or NaN
-                    rgb_buffer.append(np.array([np.nan, np.nan, np.nan]))
-                time_buffer.append(now)
-                face_buffer.append(1 if face_found else 0)
 
-                frame_placeholder.image(annotated, use_container_width=True)
-
-                # Compute metrics
-                elapsed = now - start_time
-                n = len(time_buffer)
-                if n > 1:
-                    fps_est = (n - 1) / (time_buffer[-1] - time_buffer[0] + 1e-9)
-                else:
-                    fps_est = 30.0
-                face_pct = 100.0 * sum(face_buffer) / len(face_buffer)
-
-                # ── BPM estimation ──
-                bpm, confidence = 0.0, 0.0
-                display_signal = None
-
-                if len(rgb_buffer) >= MIN_FRAMES_FOR_BPM and fps_est > 5:
-                    bpm, confidence = compute_bpm(list(rgb_buffer), fps_est)
-
-                    # Temporal smoothing: reject huge jumps
-                    if bpm > 0 and last_valid_bpm > 0:
-                        if abs(bpm - last_valid_bpm) > BPM_JUMP_THRESHOLD:
-                            # Blend toward new value instead of jumping
-                            bpm = last_valid_bpm * 0.7 + bpm * 0.3
-                            confidence *= 0.6
-
-                    if bpm > 0:
-                        bpm_raw_history.append(bpm)
-                        bpm_time_history.append(elapsed)
-
-                        # Median filter for display
-                        if len(bpm_raw_history) >= BPM_SMOOTH_WINDOW:
-                            recent = list(bpm_raw_history)[-BPM_SMOOTH_WINDOW:]
-                            smoothed = float(np.median(recent))
-                        else:
-                            smoothed = bpm
-                        bpm_smooth_history.append(smoothed)
-                        last_valid_bpm = smoothed
-                        bpm = smoothed  # use smoothed for display
-
-                        # Session stats
-                        session_bpms.append(smoothed)
-
-                    # Display signal
-                    try:
-                        display_signal = get_display_signal(list(rgb_buffer), fps_est)
-                    except Exception:
-                        pass
-
-                # ── Waveform ──
-                if display_signal is not None and len(display_signal) > 10:
-                    display_len = min(200, len(display_signal))
-                    wave = display_signal[-display_len:]
-                    wave = (wave - np.mean(wave)) / (np.std(wave) + 1e-9)
-                    chart_placeholder.line_chart(
-                        pd.DataFrame({"rPPG": wave}),
-                        height=160,
-                        use_container_width=True,
-                    )
-
-                # ── Status ──
-                if len(rgb_buffer) < MIN_FRAMES_FOR_BPM:
-                    pct_done = int(len(rgb_buffer) / MIN_FRAMES_FOR_BPM * 100)
-                    status_placeholder.markdown(
-                        f'<div class="glass-card">{render_status_badge("waiting")}'
-                        f' <span style="color:rgba(255,255,255,0.35);font-size:0.82rem;">'
-                        f'Collecting frames … {pct_done}%</span></div>',
-                        unsafe_allow_html=True,
-                    )
-                elif bpm > 0:
-                    status_placeholder.markdown(
-                        f'<div class="glass-card">{render_status_badge("active")}</div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    status_placeholder.markdown(
-                        f'<div class="glass-card">{render_status_badge("waiting")}'
-                        f' <span style="color:rgba(255,255,255,0.35);font-size:0.82rem;">'
-                        f'Stabilising signal …</span></div>',
-                        unsafe_allow_html=True,
-                    )
-
-                # ── BPM card ──
-                bpm_placeholder.markdown(
-                    f'<div class="glass-card-accent">{render_bpm_card(bpm, confidence)}</div>',
+            # ── Status ──
+            if buffer_len < MIN_FRAMES_FOR_BPM:
+                pct_done = int(buffer_len / MIN_FRAMES_FOR_BPM * 100)
+                status_placeholder.markdown(
+                    f'<div class="glass-card">{render_status_badge("waiting")}'
+                    f' <span style="color:rgba(255,255,255,0.35);font-size:0.82rem;">'
+                    f'Collecting frames … {pct_done}%</span></div>',
+                    unsafe_allow_html=True,
+                )
+            elif bpm > 0:
+                status_placeholder.markdown(
+                    f'<div class="glass-card">{render_status_badge("active")}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                status_placeholder.markdown(
+                    f'<div class="glass-card">{render_status_badge("waiting")}'
+                    f' <span style="color:rgba(255,255,255,0.35);font-size:0.82rem;">'
+                    f'Stabilising signal …</span></div>',
                     unsafe_allow_html=True,
                 )
 
-                # ── HR Zone ──
-                zone_name, zone_color = get_hr_zone(bpm)
-                zone_placeholder.markdown(
-                    f'<div class="glass-card" style="text-align:center;padding:12px;">'
-                    f'<div class="metric-label">Heart Rate Zone</div>'
-                    f'<div style="font-size:1.1rem;font-weight:700;color:{zone_color};margin-top:4px;">'
-                    f'{zone_name}</div></div>',
-                    unsafe_allow_html=True,
-                )
+            # ── BPM card ──
+            bpm_placeholder.markdown(
+                f'<div class="glass-card-accent">{render_bpm_card(bpm, confidence)}</div>',
+                unsafe_allow_html=True,
+            )
 
-                # ── Session Stats ──
-                if session_bpms:
-                    s_min = min(session_bpms)
-                    s_max = max(session_bpms)
-                    s_avg = np.mean(session_bpms)
-                    s_count = len(session_bpms)
-                else:
-                    s_min = s_max = s_avg = 0
-                    s_count = 0
-                stats_placeholder.markdown(
-                    f'<div class="glass-card-stats">{render_session_stats(s_min, s_max, s_avg, s_count)}</div>',
-                    unsafe_allow_html=True,
-                )
+            # ── HR Zone ──
+            zone_name, zone_color = get_hr_zone(bpm)
+            zone_placeholder.markdown(
+                f'<div class="glass-card" style="text-align:center;padding:12px;">'
+                f'<div class="metric-label">Heart Rate Zone</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{zone_color};margin-top:4px;">'
+                f'{zone_name}</div></div>',
+                unsafe_allow_html=True,
+            )
 
-                # ── Metrics ──
-                metrics_placeholder.markdown(
-                    f'<div class="glass-card">{render_metrics(fps_est, face_pct, len(rgb_buffer), elapsed)}</div>',
-                    unsafe_allow_html=True,
-                )
+            # ── Session Stats ──
+            if session_bpms:
+                s_min = min(session_bpms)
+                s_max = max(session_bpms)
+                s_avg = np.mean(session_bpms)
+                s_count = len(session_bpms)
+            else:
+                s_min = s_max = s_avg = 0
+                s_count = 0
+            stats_placeholder.markdown(
+                f'<div class="glass-card-stats">{render_session_stats(s_min, s_max, s_avg, s_count)}</div>',
+                unsafe_allow_html=True,
+            )
 
-                # ── BPM History ──
-                if len(bpm_smooth_history) > 1:
-                    hist_df = pd.DataFrame({"BPM": list(bpm_smooth_history)})
-                    history_placeholder.line_chart(hist_df, height=120, use_container_width=True)
+            # ── Metrics ──
+            metrics_placeholder.markdown(
+                f'<div class="glass-card">{render_metrics(fps_est, face_pct, buffer_len, elapsed)}</div>',
+                unsafe_allow_html=True,
+            )
 
-                time.sleep(0.005)
+            # ── BPM History ──
+            if len(bpm_history) > 1:
+                hist_df = pd.DataFrame({"BPM": bpm_history})
+                history_placeholder.line_chart(hist_df, height=120, use_container_width=True)
 
-        finally:
-            cap.release()
     else:
         # ── Idle state ──
         with col_vitals:
@@ -1140,18 +1201,6 @@ def main():
             )
             metrics_placeholder.markdown(
                 f'<div class="glass-card">{render_metrics(0, 0, 0, 0)}</div>',
-                unsafe_allow_html=True,
-            )
-
-        with col_cam:
-            frame_placeholder.markdown(
-                '<div class="glass-card idle-camera">'
-                '<div class="idle-icon">📷</div>'
-                '<div class="idle-text">'
-                'Press <strong>▶ Start Monitoring</strong> to begin<br>'
-                'live heart rate tracking'
-                '</div>'
-                '</div>',
                 unsafe_allow_html=True,
             )
 
