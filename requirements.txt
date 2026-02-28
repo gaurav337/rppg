@@ -1,1 +1,6 @@
-
+streamlit
+opencv-python
+dlib
+numpy
+scipy
+pandas
