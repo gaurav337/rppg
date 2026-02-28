@@ -1,6 +1,6 @@
 streamlit
 streamlit-webrtc==0.64.5
-av==12.3.0
+av>=14.0.0,<16.0.0
 opencv-python-headless
 dlib-bin
 numpy
